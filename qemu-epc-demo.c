@@ -1,275 +1,343 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/module.h>
-#include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/pci-epc.h>
 #include <linux/pci-epf.h>
-#include <linux/pci_ids.h>
-#include <linux/kthread.h>
+#include <linux/io.h>
 #include <linux/delay.h>
 
+/* QEMU EPC PCI IDs */
+#define VENDOR_ID       0x1b36
+#define DEVICE_ID       0x0013
 
-#define EPF_DEMO_VENDOR_ID 0x1234
-#define EPF_DEMO_DEVICE_ID 0xDEAD
+/* BAR indices */
+#define BAR_CTRL        0
+#define BAR_PCI_CFG     1
+#define BAR_BAR_CFG     2
+#define BAR_OB_WIN      3
 
-#define EPF_DEMO_BAR0       BAR_0
-#define EPF_DEMO_BAR1       BAR_1
-#define EPF_DEMO_BAR2       BAR_2
+/* CTRL Register offsets */
+#define CTRL_OFF_START          0x00
+#define CTRL_OFF_WIN_START      0x08
+#define CTRL_OFF_WIN_SIZE       0x10
+#define CTRL_OFF_IRQ_TYPE       0x18
+#define CTRL_OFF_IRQ_NUM        0x1c
+#define CTRL_OFF_OB_MAP_MASK    0x20
+#define CTRL_OFF_OB_IDX         0x24
+#define CTRL_OFF_OB_MAP_PHYS    0x28
+#define CTRL_OFF_OB_MAP_PCI     0x30
+#define CTRL_OFF_OB_MAP_SIZE    0x38
 
-#define EPF_DEMO_BAR_SIZE   4096
+/* BAR Register offsets */
+#define BAR_CFG_OFF_MASK        0x00
+#define BAR_CFG_OFF_NUMBER      0x01
+#define BAR_CFG_OFF_FLAG        0x02
+#define BAR_CFG_OFF_PHYS_ADDR   0x08
+#define BAR_CFG_OFF_SIZE        0x10
 
-// ! Represent a PCI Configuration Space
-static struct pci_epf_header epf_demo_header = {
-    .vendorid = EPF_DEMO_VENDOR_ID,
-    .deviceid = EPF_DEMO_DEVICE_ID,
-    .baseclass_code = PCI_CLASS_OTHERS,
-    .interrupt_pin = PCI_INTERRUPT_INTA,
+#define OB_WINDOW_SIZE          0x100000
+#define NUM_OB_MAPS             32
+
+struct qemu_epc {
+    struct pci_dev *pdev;
+    struct pci_epc *epc;
+
+    void __iomem *ctrl_region;
+    void __iomem *pci_cfg_region;
+    void __iomem *bar_cfg_region;
+    void __iomem *ob_window_region;
+
+    phys_addr_t ob_window_phys;
 };
 
-struct epf_demo {
-    struct pci_epf* epf;
-    struct task_struct* epf_thread;
+/* Internal Function Interface */
+static void qemu_epc_ctrl_start(struct qemu_epc *priv);
+static void qemu_epc_stop(struct pci_epc* epc);
 
-    void* bar_buf[3];
-};
+static void qemu_epc_write_pci_cfg_region(struct qemu_epc * priv, u16 offset,
+                                   void* buf, size_t size);
+static void qemu_epc_read_pci_cfg_region(struct qemu_epc* priv, u16 offset,
+                                  void* buf, size_t size);
 
-enum EPF_DEMO_BAR_REG_OFF {
-    BAR0_REG_MAGIC     = 0x00,
-    BAR0_REG_DOORBELL  = 0x04,
-    BAR0_HOST_SIZE     = 0x08,
-    BAR0_EP_SIZE       = 0x0C,
-};
 
-void handle_host_request(struct epf_demo * demo)
+
+/* CTRL Helper */
+static void qemu_epc_ctrl_start(struct qemu_epc *priv)
 {
-    u32 size = readl(demo->bar_buf[EPF_DEMO_BAR0] + BAR0_HOST_SIZE);
-    pr_info("qemu-epf-demo: Receive doorbell from Host, size=%u\n", size);
-
-    /* Read Bar 1 Content*/
-    size = min_t(u32, EPF_DEMO_BAR_SIZE-1, size);
-    ((char *)demo->bar_buf[1])[size] = '\0';
-
-    pr_info("qemu-epf-demo: Bar1 content:\n");
-    pr_info("%s\n", (char *)demo->bar_buf[1]);
-
-
-    /* Userspace Logic */
-    char *alphaBuf = kmalloc(size + 1, GFP_KERNEL);  // ✅
-    if (!alphaBuf) {
-        pr_err("kmalloc() failed\n");
-        return;
-    }
-    alphaBuf[size] = '\0';
-
-    for (int i = 0; i < size; i++) {
-        char ch = ((char *)demo->bar_buf[EPF_DEMO_BAR1])[i];
-        if ( ch >= 'A' && ch <= 'Z')
-            alphaBuf[i] = ch + 32;
-        else if (ch >= 'a' && ch <= 'z')
-            alphaBuf[i] = ch - 32;
-        else alphaBuf[i] = ch;
-    }
-
-
-    pr_info("qemu-epf-demo: Send Message size: %u\n", size);
-    writel(size, demo->bar_buf[EPF_DEMO_BAR0] + BAR0_EP_SIZE); 
-    memcpy_toio(demo->bar_buf[EPF_DEMO_BAR2], alphaBuf, ALIGN(size, 4)); 
-    kfree(alphaBuf);
-    return;
+    writel(1, priv->ctrl_region + CTRL_OFF_START);
+    
+    msleep(100);
+    pr_info("qemu-epc-demo: Qemu-EPC started\n");
 }
 
-static int epf_demo_thread(void *data)
+
+static void qemu_epc_ctrl_stop(struct qemu_epc *priv)
 {
-    struct epf_demo* demo = data;
-    u32 doorbell;
-    u32 size;
+    writel(0, priv->ctrl_region + CTRL_OFF_START);
+    pr_info("qemu-epc-demo: Qemu-EPC stopped\n");
+}
 
-    pr_info("qemu-epf-demo: Doorbell polling thread started\n");
-    void *bar0_buf = demo->bar_buf[0];
 
-    while (!kthread_should_stop()) {
-        doorbell = readl(bar0_buf + BAR0_REG_DOORBELL);
-        if (doorbell) {
-            handle_host_request(demo);
+/* PCI CFG Helper */
 
-            /* Raise IRQ */
-            writel(0, bar0_buf + BAR0_REG_DOORBELL);
+static void qemu_epc_write_pci_cfg_region(struct qemu_epc * priv, u16 offset,
+                                   void* buf, size_t size)
+{
+    /* Copy data to MMIO memory
+        The function guarantee that write order is not reordered
+        - By compiler
+        - By CPU 
+        - No cache
 
-            pci_epc_raise_irq(demo->epf->epc, demo->epf->func_no,
-                              demo->epf->vfunc_no, PCI_EPC_IRQ_LEGACY, 1);
-            pr_info("epf-demo: IRQ raised!\n");
-        }
-        msleep(5);
-    }
-    pr_info("qemu-epf-demo: thread stopped\n");
+        This is important when writing to hardware register since
+        write to specific register might trigger the action immediately
+        
+        1. Write to certain MMIO address 
+        - Write physical address -> hardware stores the value, no action
+        - Write Size -> hardware triggers BAR Setup
+
+        2. DMA engine
+        - Write Src addr -> just store
+        - Write Dst addr -> just store
+        - Write Size     -> just store
+        - Write Start=1  -> Trigger DMA !
+    */
+    memcpy_toio(priv->pci_cfg_region + offset, buf, size);
+}
+
+static void qemu_epc_read_pci_cfg_region(struct qemu_epc* priv, u16 offset,
+                                  void* buf, size_t size)
+{
+    memcpy_fromio(buf, priv->pci_cfg_region + offset, size);
+}
+
+
+/* PCI EPC Ops - called by the EPF Framework */
+static int qemu_epc_write_header(struct pci_epc *epc, u8 func_no, 
+                                 u8 vfunc_no, struct pci_epf_header *hdr)
+{
+    struct qemu_epc* priv = epc_get_drvdata(epc);
+    u16 vendor_device[2] = {
+        hdr->vendorid,
+        hdr->deviceid,
+    };
+    u8 rev_class[3] = {
+        hdr->revid,
+        hdr->baseclass_code,
+        hdr->subclass_code
+    };
+
+    pr_info("qemu-epc-demo: Write Header: VendorId:0x%x DeviceId: 0x%lx\n",
+            vendor_device[0], vendor_device[1]);
+    
+    qemu_epc_write_pci_cfg_region(priv, PCI_VENDOR_ID, 
+                           vendor_device, sizeof (vendor_device));
+    qemu_epc_write_pci_cfg_region(priv, PCI_REVISION_ID,
+                           rev_class, sizeof(rev_class));
+
+    pr_info("qemu-epc-demo: interrupt_pin value=0x%x offset=0x%x size=%zu\n",
+            hdr->interrupt_pin, PCI_INTERRUPT_PIN, sizeof(hdr->interrupt_pin));
+
+    qemu_epc_write_pci_cfg_region(priv, PCI_INTERRUPT_PIN, 
+                               &hdr->interrupt_pin, sizeof(hdr->interrupt_pin));
+    
+    return 0;
+}
+static int qemu_epc_set_bar(struct pci_epc *epc, u8 func_no,
+                            u8 vfunc_no,struct pci_epf_bar *epf_bar)
+{
+    struct qemu_epc* priv = epc_get_drvdata(epc);
+    u8 mask;
+    pr_info("qemu-epc-demo: set bar: %d phys: 0x%llx size: 0x%llx\n",
+            epf_bar->barno, epf_bar->phys_addr, epf_bar->size);
+
+    // ! 1. Bar Number
+    writeb(epf_bar->barno, priv->bar_cfg_region + BAR_CFG_OFF_NUMBER);
+    // wmb();
+
+    // ! 2. Bar flag
+    writeb(epf_bar->flags, priv->bar_cfg_region + BAR_CFG_OFF_FLAG);
+
+    // ! 3. BAR physical address (low then high)
+    writel((u32)(epf_bar->phys_addr & 0xFFFFFFFF),
+           priv->bar_cfg_region + BAR_CFG_OFF_PHYS_ADDR);
+    writel((u32)(epf_bar->phys_addr >> 32),
+           priv->bar_cfg_region + BAR_CFG_OFF_PHYS_ADDR + 4);
+
+    // 4. BAR size (low then high)
+    writel((u32)(epf_bar->size & 0xFFFFFFFF),
+           priv->bar_cfg_region + BAR_CFG_OFF_SIZE);
+    writel((u32)(epf_bar->size >> 32),
+           priv->bar_cfg_region + BAR_CFG_OFF_SIZE + 4);
+    
+    // wmb(); 
+    // ! 5. Update mask - Specifies which BAR region is set
+    mask = readb(priv->bar_cfg_region + BAR_CFG_OFF_MASK);
+    mask |= (1 << epf_bar->barno);
+    writeb(mask, priv->bar_cfg_region + BAR_CFG_OFF_MASK);
+
+
     return 0;
 }
 
-/* Bind - called when the EPF is bounded to an EPC 
-   This is where we set up the BAR0
-*/
-static int epf_demo_bind(struct pci_epf *epf)
+static int qemu_epc_raise_irq(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			                  enum pci_epc_irq_type type, u16 interrupt_num)
 {
-    struct epf_demo *demo = epf_get_drvdata(epf);
-    struct pci_epc *epc = epf->epc;
-    struct pci_epf_bar* epf_bar;
+    struct qemu_epc* priv = epc_get_drvdata(epc);
+    pr_info("qemu-epc-demo: Raise IRQ %d\n", interrupt_num);
+
+    writel(type, priv->ctrl_region + CTRL_OFF_IRQ_TYPE);
+    writel(interrupt_num, priv->ctrl_region + CTRL_OFF_IRQ_NUM);
+    
+    return 0;
+}
+
+static int qemu_epc_start(struct pci_epc *epc)
+{
+    struct qemu_epc* priv = epc_get_drvdata(epc);
+
+    pr_info("qemu-epc-demo: start\n");
+    qemu_epc_ctrl_start(priv);
+    return 0;
+}
+
+static void qemu_epc_stop(struct pci_epc* epc)
+{
+    struct qemu_epc* priv = epc_get_drvdata(epc);
+    pr_info("qemu-epc-demo: stop\n");
+
+    qemu_epc_ctrl_stop(priv);
+}
+
+static const struct pci_epc_ops qemu_epc_ops = {
+    .start          = qemu_epc_start,
+    .stop           = qemu_epc_stop,
+    .write_header   = qemu_epc_write_header,
+    .set_bar        = qemu_epc_set_bar,
+    .raise_irq      = qemu_epc_raise_irq,
+};
+
+
+/* 
+    PCI Driver probe / remove 
+    Note: This is called when the kernel discover the "Qemu-EPC"
+*/
+static int qemu_epc_probe(struct pci_dev *dev, const struct pci_device_id *id)
+{
+    struct qemu_epc* priv;
+    struct pci_epc*  epc;
     int err;
-    int i;
 
-    pr_info("qemu-epf-demo: bind is called\n");
-
-    /* Allocate 4KB Buffer for all Bar buffer */
-    for (i = EPF_DEMO_BAR0; i <= EPF_DEMO_BAR2; i++) {
-        demo->bar_buf[i] = pci_epf_alloc_space(epf, EPF_DEMO_BAR_SIZE, i, 0, PRIMARY_INTERFACE);
-        if (!demo->bar_buf[i]) {
-            pr_err("qemu-epf-demo: pci_epf_alloc_space() failed\n");
-            goto err_bar_alloc;
-        }
+    pr_info("qemu-epc-demo: probe %s\n", pci_name(dev));
+    
+    priv = devm_kzalloc(&dev->dev, sizeof(*priv), GFP_KERNEL);
+    if (priv == NULL) {
+        pr_debug("qemu-epc-demo: devm_kzalloc() failed\n");
+        return -ENOMEM;
     }
+    priv->pdev = dev;
 
-    /* Magic Value */
-    *(uint32_t *)demo->bar_buf[0] = 0xcafebabe;
-
-    /* EPC Side */
-    err = pci_epc_write_header(epc, epf->func_no, epf->vfunc_no, &epf_demo_header);
+    // ! Device is discovered, but everything is not set up in the device
+    // ! 1. Therefore first thing is to enable the device
+    //      - BARs accessible 
+    //      - Interrupt working
+    //      - Device ready to use
+    err = pci_enable_device(dev);
     if (err) {
-        pr_err("qemu-epf-demo: pci_epc_write_header() failed to write header: %d\n", err);
+        dev_err(&dev->dev, "Failed to enable device: %d\n", err);
         return err;
     }
 
-    /* Set BAR */
-    for (i = EPF_DEMO_BAR0; i <= EPF_DEMO_BAR2; i++) {
-        epf_bar = &epf->bar[i];
-        err = pci_epc_set_bar(epc, epf->func_no, epf->vfunc_no, epf_bar);
-        if (err) {
-            pr_err("qemu-epf-demo: pci_epc_set_bar() failed to set BAR: %d\n", err);
-            goto err_set_bar;
-        }
-        pr_info("qemu-epf-demo: BAR%i size: %u\n", i, epf_bar->size);
+    // ! 2. Set the Bus Master Enable bit in PCI Config space command register
+    // ! This allow the device initiate transaction to Host
+    pci_set_master(dev);
+
+    // ! 3. Claim ownership of the device BAR memory
+    // ! So that no other driver besides "qemu-epc" could use that addresses
+    //   calls request_mem_region() on each BAR
+    //   -> register them in /proc/iomem as owned by "qemu-epc"
+
+    err = pci_request_regions(dev, "qemu-epc");
+    if (err) {
+        dev_err(&dev->dev, "pci_request_regions() failed%d\n", err);
+        goto err_disable;
     }
-    pr_info("qemu-epf-demo: bind is completed\n");
-    
-    /* Polling thread for doorbell mechanism: Host notice EP */
-    demo->epf_thread = kthread_run(epf_demo_thread, demo, "epf-demo");
-    if (IS_ERR(demo->epf_thread)) {
-        pr_err("qemu-epf-demo: kthread_run() failed:\n");
-        err = PTR_ERR(demo->epf_thread);
-        goto err_set_bar;
+
+    /* Map all 4 BARS */
+    priv->ctrl_region       = pcim_iomap(dev, BAR_CTRL, 0);
+    priv->bar_cfg_region    = pcim_iomap(dev, BAR_BAR_CFG, 0);
+    priv->pci_cfg_region    = pcim_iomap(dev, BAR_PCI_CFG, 0);
+    priv->ob_window_region  = pcim_iomap(dev, BAR_OB_WIN, 0);
+
+    if (!priv->ctrl_region || !priv->bar_cfg_region || !priv->pci_cfg_region
+        || !priv->ob_window_region) {
+        dev_err(&dev->dev, "Failed to map BAR\n");
+        err = -ENOMEM;
+        goto err_release;
     }
+
+    // ! Get and store the physical address directly
+    //   Since the outbound window is used for dma, 
+    //   the dma engine work directly on physical address
+    priv->ob_window_phys = pci_resource_start(dev, BAR_OB_WIN);
+    pr_info("qemu-epc-demo: ctrl region addr (BAR 0): %p\n", priv->ctrl_region);
+    pr_info("qemu-epc-demo: pci config region addr (BAR 1): %p\n", priv->pci_cfg_region);
+    pr_info("qemu-epc-demo: bar config region addr (BAR 2): %p\n", priv->bar_cfg_region);
+    pr_info("qemu-epc-demo: ob window region addr (BAR 3): %p\n", priv->ob_window_region);
+
+
+    /* Create EPC Controller */
+    epc = devm_pci_epc_create(&dev->dev, &qemu_epc_ops);
+    if (IS_ERR(epc)) {
+        err = PTR_ERR(epc);
+        dev_err(&dev->dev, "devm_pci_epc_create() failed: %d\n", err);
+        goto err_release;
+    }
+
+    priv->epc = epc;
+    epc_set_drvdata(epc, priv);
+    pci_set_drvdata(dev, priv);
+
+    /* set EPC capabilities */
+    epc->max_functions = 1;
+    pr_info("qemu-epc-demo: EPC Controller is registered!\n");
+    pr_info("qemu-epc-demo: Check /sys/kernel/config/pci_ep/controllers/\n");
     return 0;
 
-err_set_bar:
-    i--;
-    for (; i >= 0; i--) {
-        pci_epc_clear_bar(epc, epf->func_no, epf->vfunc_no, &epf->bar[i]);
-        pci_epf_free_space(epf, demo->bar_buf[i], i, PRIMARY_INTERFACE);
-    }
+err_release:
+    pci_release_regions(dev);
+err_disable:
+    pci_disable_device(dev);
     return err;
-
-err_bar_alloc:
-    i--;
-    for (; i >= 0; i--)
-        pci_epf_free_space(epf, demo->bar_buf[i], i, PRIMARY_INTERFACE);
-    return -ENOMEM;
 }
-/* unbind - callled when EPF is unbound from EPC */
-static void epf_demo_unbind(struct pci_epf *epf)
+static void qemu_epc_remove(struct pci_dev *dev)
 {
-    struct epf_demo* demo = epf_get_drvdata(epf);
-    struct task_struct* qemu_thread = demo->epf_thread;
-    struct pci_epc* epc = epf->epc;
-
-    pr_info("qemu-epf-demo: unbind is called\n");
-    kthread_stop(demo->epf_thread);
-    demo->epf_thread = NULL;
-
-    for (int i = EPF_DEMO_BAR0; i <= EPF_DEMO_BAR2; i++) {
-        pci_epc_clear_bar(epc, epf->func_no, epf->vfunc_no, &epf->bar[i]);
-        pci_epf_free_space(epf, demo->bar_buf[i], i, PRIMARY_INTERFACE);
-    }
+    pr_info("qemu-epc-demo: Remove\n");
+    pci_release_regions(dev);
+    pci_disable_device(dev);
 }
 
-static struct pci_epf_ops epf_demo_ops = {
-    .bind = epf_demo_bind,
-    .unbind = epf_demo_unbind,
-};
-
-/* Probe : called when device and the driver meet each other.
-
-    1. Create a device through: 
-        mkdir /sys/kernel/config/pci_ep/functions/qemu-epf-demo/func1
-                                                  ^^^^^^^^^^^^^
-                                           this part is the driver name   
-    2. Install our driver:
-            insmod qemu-epf-demo.ko
-            module_init() -> pci_epf_register_driver(&epf_demo_driver) -> driver_register()
-    
-    Note that both of them trigger a bus scan.
-    Device side, it scans whether there is a driver called "qemu-epf-demo"
-    Driver side, it scans whether there is a device called "qemu-epf-demo"
-
-*/
-
-static int epf_demo_probe(struct pci_epf* epf)
-{
-    struct epf_demo* demo;
-    pr_info("qemu-epf-demo: probe is called!\n");
-
-    // ! Allocate memory
-    // ! devm version : Automatically released when the device is removed
-    demo = devm_kzalloc(&epf->dev, sizeof(*demo), GFP_KERNEL);
-    if (demo == NULL) {
-        pr_info("qemu-epf-demo: devm_kzalloc() failed\n");
-        return -ENOMEM;
-    }
-
-    // ! Set header & Save driver private info --> for later bind use
-    demo->epf = epf;
-    epf->header = &epf_demo_header;
-    epf_set_drvdata(epf, demo);
-
-    return 0;
-}
-
-/* ! Driver Setup */ 
-
-static struct pci_epf_device_id epf_demo_ids[] = {
-    {.name = "qemu-epf-demo"},
+static struct pci_device_id qemu_epc_ids[] = {
+    {PCI_DEVICE(VENDOR_ID, DEVICE_ID)},
     {}
 };
 
-static struct pci_epf_driver epf_demo_driver = {
-    .driver.name = "qemu-epf-demo",
-    .probe       = epf_demo_probe,
-    .ops         = &epf_demo_ops,
-    .owner       = THIS_MODULE,
-    .id_table    = epf_demo_ids     // Use id table to match first, if no match then use the name
+// ! This expose the device ID table to userspace so udev can
+// automatically load the driver when the device is detected.
+// udev -> Hotplug
+
+MODULE_DEVICE_TABLE(pci, qemu_epc_ids);
+
+static struct pci_driver qemu_epc_driver = {
+    .name     = "qemu-epc",
+    .id_table = qemu_epc_ids,
+    .probe    = qemu_epc_probe,
+    .remove   = qemu_epc_remove,
 };
 
-static int __init epf_demo_init(void)
-{
+// module_init / module_exit
+module_pci_driver(qemu_epc_driver);
 
-    // ! Register the driver 
-    int err;
-    err = pci_epf_register_driver(&epf_demo_driver);
- 
-    if (err) {
-        pr_info("qemu-epf-demo: pci_epf_register_driver() failed\n");
-        return err;
-    }
-
-    pr_info("qemu-epf-demo: Driver is registered\n");
-    return 0;
-}
-
-static void __exit epf_demo_exit(void)
-{
-    pci_epf_unregister_driver(&epf_demo_driver);
-    pr_info("Driver is removed\n");
-}
-
-module_init(epf_demo_init);
-module_exit(epf_demo_exit);
-
-MODULE_DESCRIPTION("Simple PCI EPF demo driver");
+MODULE_DESCRIPTION("QEMU EPC kernel driver");
 MODULE_AUTHOR("Elton Wong");
 MODULE_LICENSE("GPL");
