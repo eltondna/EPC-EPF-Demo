@@ -1,7 +1,4 @@
 # PCIe Endpoint Function Demo
-### Bidirectional Shared Buffer over QEMU Virtual PCIe
-
----
 
 ## 1. Overview
 
@@ -53,76 +50,506 @@ Host IRQ handler
 | BAR0 | 4 KB | Read/Write | Control registers: `REG_MAGIC` (0x00), `REG_DOORBELL` (0x04), `HOST_SIZE` (0x08), `EP_SIZE` (0x0C) |
 | BAR1 | 4 KB | Host → EP | Data buffer: host writes message here before ringing doorbell |
 | BAR2 | 4 KB | EP → Host | Response buffer: EP writes processed result here before raising IRQ |
-
 ---
 
-## 2. Code Structure
+## 2. The Linux PCIe Endpoint Framework
 
-### 2.1 `qemu-host-demo.ko` — Host PCI Driver
+Many modern SoCs integrate PCIe controller IPs that can operate in both Root Complex and Endpoint mode. In Endpoint mode, the SoC presents itself as a PCIe device to an external host. Different controller IPs — such as DesignWare, Cadence, or a QEMU virtual controller — expose different internal register interfaces for programming the configuration space, setting up BARs, and raising interrupts.
 
-A standard Linux PCI driver that runs on the host VM. It is matched to the EP device by Vendor/Device ID (`0x1234:0xDEAD`) and handles the host side of the communication protocol.
+Without a common framework, each endpoint function driver (NVMe, NIC, NTB, etc.) would need to be rewritten for every controller. A developer porting an NVMe endpoint from a DesignWare-based SoC to a Cadence-based SoC would have to rewrite the hardware programming even though the NVMe protocol logic is identical. This creates unnecessary code duplication and increases maintenance cost.
 
-**Key functions:**
+The Linux PCIe Endpoint Framework solves this by splitting the software
+into three components:
 
-| Function | Description |
-|----------|-------------|
-| `epf_host_probe()` | Enables device, requests regions, maps BAR0/1/2 via `pcim_iomap()`, registers IRQ handler, verifies magic value (`0xcafebabe`), then sends the initial test message to the EP. |
-| `epf_host_irq_handler()` | Fires when EP raises a legacy IRQ. Reads `EP_SIZE` from BAR0, allocates a kernel buffer with `GFP_ATOMIC`, reads the EP response from BAR2 via `memcpy_fromio()`, and prints it. |
-| `epf_host_remove()` | Frees IRQ, releases PCI regions, disables device. |
+**EPC (Endpoint Controller) library**
 
-**MMIO access rule:**
-Host-side BARs are MMIO mappings. All reads must use `readl()`/`ioread32()` for single registers or `memcpy_fromio()` for bulk data. All writes must use `writel()`/`iowrite32()` or `memcpy_toio()`. Direct pointer casts are undefined behavior on MMIO memory.
+- Abstracts the hardware. Eachcontroller vendor provides an EPC driver that implements a standard set of operations (`pci_epc_ops`): writing the config header, configuring BARs, raising interrupts, and starting/stopping the link.
 
-**DWORD alignment requirement:**
-The QEMU `epf-bridge` encodes write length in the TLP header as `length >> 2` (DWORDs). Sub-4-byte writes produce a TLP with `length=0`, corrupting the socket stream. All `memcpy_toio()` calls must use `ALIGN(len, 4)` and write from a zero-padded buffer to avoid reading past the source buffer end.
+**EPF (Endpoint Function) library** 
 
----
+- Implements the device logic. An EPF driver calls hardware-agnostic APIs like `pci_epc_set_bar()` and `pci_epc_raise_irq()`. The EPC core dispatches these calls through the ops vtable to the correct hardware-specific implementation. The EPF driver works unchanged across any controller.
 
-### 2.2 `qemu-epf-demo.ko` — EP Function Driver
+**Configfs layer**
 
-The EPF (Endpoint Function) driver runs on the EP VM and implements the application logic of the demo device. This layer is hardware-independent — it only interacts with the `pci_epf` framework abstractions and would work unchanged on real PCIe hardware with a different EPC driver.
+- Binds EPF devices to EPC controllers at runtime from userspace, without recompiling or modifying kernel code.
 
-**Key functions:**
+In the below section, we will explain briefly about each layers with the code example from our demo.
 
-| Function | Description |
-|----------|-------------|
-| `epf_demo_probe()` | Called when the EPF device is created via configfs. Allocates the `epf_demo` private struct and stores it as driver data. |
-| `epf_demo_bind()` | Called when the EPF is linked to an EPC controller. Allocates 4 KB BAR buffers via `pci_epf_alloc_space()`, writes the PCI config space header, configures all three BARs via `pci_epc_set_bar()`, writes magic value `0xcafebabe` into BAR0, and starts the doorbell polling kthread. |
-| `epf_demo_unbind()` | Stops the kthread, clears all BARs, and frees BAR buffers. |
-| `epf_demo_thread()` | Kthread polling BAR0 doorbell register every 5 ms. When doorbell == 1, calls `handle_host_request()`, clears the doorbell, then raises a legacy IRQ via `pci_epc_raise_irq()`. |
-| `handle_host_request()` | Reads `HOST_SIZE` from BAR0, reads the message from `bar_buf[1]` (direct RAM access), performs case inversion into a `kmalloc`'d buffer, writes `EP_SIZE` to BAR0, and copies the result to `bar_buf[2]` via `memcpy_toio()`. |
 
-**EP vs Host memory access:**
-Unlike the host driver, the EP accesses `bar_buf[]` directly via pointer because `pci_epf_alloc_space()` returns a normal kernel virtual address backed by real RAM. TLPs from the host land in this RAM via DMA — no special accessors are needed on the EP side.
+## 3. EPC Layer - Hardware Abstraction
 
----
+**The EPC layer/driver only has 2 roles**:
 
-### 2.3 `qemu-epc.ko` — EPC Controller Driver
+1. Expose the set of standard functions (`pci_epc_ops`) to the EPF_layer
+2. Implement the function detail (Hardware Configuration detail)
 
-The EPC (Endpoint Controller) driver runs on the EP VM and sits between the EPF framework and the QEMU virtual PCIe hardware. It translates `pci_epc_ops` callbacks into MMIO writes to the QEMU EPC device's control registers. On real hardware, this layer would be replaced by a vendor-provided EPC driver (e.g. Designware, Cadence) — the EPF driver above would remain unchanged.
 
-**QEMU EPC BAR layout (internal, not visible to host):**
+Before we introduce each aspect of the EPC layer, it would be clearer to introduce 
+a bit about the demo underlying hardware: `qemu-epc`, which is the device that `qemu-epc-demo` driver directly talk to. Overall, the `qemu-epc` config space has 4 BARs, which are:
+```c
+// qemu-epc-demo.ko
+#define BAR_CTRL        0
+#define BAR_PCI_CFG     1
+#define BAR_BAR_CFG     2
+#define BAR_OB_WIN      3
+```
+and each region contains multiple registers at different offset, for example:
 
-| BAR | Name | Purpose |
-|-----|------|---------|
-| BAR0 | `CTRL` | Start/stop EPC, IRQ type/number, outbound window map configuration |
-| BAR1 | `PCI_CFG` | PCI configuration space mirror — written by `write_header()` |
-| BAR2 | `BAR_CFG` | BAR configuration registers — written by `set_bar()` to tell QEMU where each EPF BAR's physical memory lives |
-| BAR3 | `OB_WIN` | Outbound window — used for EP-initiated DMA to host memory |
+```c
+/* BAR Register offsets */
+#define BAR_CFG_OFF_MASK        0x00
+#define BAR_CFG_OFF_NUMBER      0x01
+#define BAR_CFG_OFF_FLAG        0x02
+#define BAR_CFG_OFF_PHYS_ADDR   0x08
+#define BAR_CFG_OFF_SIZE        0x10
+```
 
-**Key `pci_epc_ops` implemented:**
+The base address of each BAR is allocated by the Kernel at runtime. Therefore configuring the hardware here means writing certain value to certain registers in a certain BAR region, for example this is a function to start the `qemu-epc` device (which is called in the `start()`)
 
-| Callback | Implementation |
-|----------|----------------|
-| `qemu_epc_write_header()` | Writes vendor ID, device ID, revision, class code, and interrupt pin into the `PCI_CFG` BAR via `memcpy_toio()`. |
-| `qemu_epc_set_bar()` | Writes bar number (1 byte), flags (1 byte), physical address (8 bytes), and size (8 bytes) into the `BAR_CFG` region. Writes the mask register last as a commit trigger. |
-| `qemu_epc_raise_irq()` | Writes IRQ type then interrupt number to the `CTRL` region. Writing interrupt number triggers QEMU to send a TLP MSG (INTA assertion) to the host. |
-| `qemu_epc_start()` | Writes 1 to `CTRL_OFF_START`. QEMU spawns a thread that listens on a Unix socket for TLP messages from `epf-bridge`. |
+```c
+static void qemu_epc_ctrl_start(struct qemu_epc *priv)
+{
+    writel(1, priv->ctrl_region + CTRL_OFF_START);
+    
+    msleep(100);
+    pr_info("qemu-epc-demo: Qemu-EPC started\n");
+}
+```
 
-**`set_bar()` write width requirement:**
-The BAR number and flags registers are 1-byte fields at offsets `0x01` and `0x02`. They must be written with `writeb()` not `writel()`. Writing 4 bytes to offset `0x02` spills into reserved offsets `0x03–0x05` and corrupts the BAR configuration for subsequent BARs.
+Thus the goal for EPC is clear: implement all these hardware details, and abstracting them into a set of standard API `pci_epc_ops` to EPF :)
 
-## How to run
+
+###  3.1 The `pci_epc_ops` Vtable
+
+`struct pci_epc_ops` is the set of standard functions that EPF drivers could use to configure the hardware. Each EPC driver fills its own implementation.
+
+```c
+// pci_epc.h
+struct pci_epc_ops {
+	int	(*write_header)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+				struct pci_epf_header *hdr);
+	int	(*set_bar)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			   struct pci_epf_bar *epf_bar);
+	void (*clear_bar)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			     struct pci_epf_bar *epf_bar);
+	int	(*map_addr)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			    phys_addr_t addr, u64 pci_addr, size_t size);
+	void (*unmap_addr)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			      phys_addr_t addr);
+	int	(*set_msi)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			   u8 interrupts);
+	int	(*get_msi)(struct pci_epc *epc, u8 func_no, u8 vfunc_no);
+	int	(*set_msix)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			    u16 interrupts, enum pci_barno, u32 offset);
+	int	(*get_msix)(struct pci_epc *epc, u8 func_no, u8 vfunc_no);
+	int	(*raise_irq)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			     enum pci_epc_irq_type type, u16 interrupt_num);
+	int	(*map_msi_irq)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			       phys_addr_t phys_addr, u8 interrupt_num,
+			       u32 entry_size, u32 *msi_data,
+			       u32 *msi_addr_offset);
+	int	(*start)(struct pci_epc *epc);
+	void (*stop)(struct pci_epc *epc);
+	const struct pci_epc_features* (*get_features)(struct pci_epc *epc,
+						       u8 func_no, u8 vfunc_no);
+	struct module *owner;
+};
+
+```
+
+In the `qemu-epc-demo`, we only implement part of the functions that are used in our EPF layer.
+```c
+static const struct pci_epc_ops qemu_epc_ops = {
+    .write_header   = qemu_epc_write_header,
+    .set_bar        = qemu_epc_set_bar,
+    .clear_bar      = qemu_epc_clear_bar,
+    .start          = qemu_epc_start,
+    .stop           = qemu_epc_stop,
+    .raise_irq      = qemu_epc_raise_irq,
+};
+```
+
+
+### 3.2 EPC Probe - Register as a Controller
+
+Everything in the EPC Layer start with the `.probe` function, which is called when the `device` meets our driver, or vice versa. When we install the epc driver with `insmod qemu-epc-demo.ko`, the kernel load and create a pci_driver instance with the information we provided in the module:
+```c
+static struct pci_driver qemu_epc_driver = {
+    .name     = "qemu-epc",
+    .id_table = qemu_epc_ids,
+    .probe    = qemu_epc_probe,
+    .remove   = qemu_epc_remove,
+};
+```
+The kernel execute bus enumeration, scan the pci_bus to look for a device with name = `qemu-epc`. If the device is founded, our `.probe()` function is eventually called and which allow the driver set up the device.
+
+3 device-Specific functions are called in the `.probe()`:
+
+- `pci_enable_device()`: Enable the device, Interrupt working, make device ready-to-use.
+
+- `pci_set_master()`: Enable device initiate transaction to Host, needed for interrupt signal and outbound dma.
+
+- `pci_request_region()`: Make the device BAR memory private, when set, only this driver could operate on this device BAR memory.
+
+Remember our demo device `qemu-epc` has 4 BAR region. The physical addresses of the region are already allocated, we need them to implement our `pci_ep_ops`.
+Therefore we have a private struct `struct qemu-epc` to store these addresses so that we could reference them, and also other important structure such as the `pci_dev` and the `pci_epc`.
+
+```c
+struct qemu_epc {
+    struct pci_dev *pdev;
+    struct pci_epc *epc;
+
+    void __iomem *ctrl_region;
+    void __iomem *pci_cfg_region;
+    void __iomem *bar_cfg_region;
+    void __iomem *ob_window_region;
+
+    phys_addr_t ob_window_phys;
+};
+```
+
+Now we have a place to store the BAR addresses, but they are physical addresses in the MMIO address space assigned by the kernel during PCI enumeration. We cannot access physical address directly.  
+
+```c
+// qemu-epc-demo.c
+
+struct qemu_epc* priv;
+priv = devm_kzalloc(&dev->dev, sizeof(*priv), GFP_KERNEL);
+...
+
+priv->ctrl_region       = pcim_iomap(dev, BAR_CTRL, 0);
+priv->bar_cfg_region    = pcim_iomap(dev, BAR_BAR_CFG, 0);
+priv->pci_cfg_region    = pcim_iomap(dev, BAR_PCI_CFG, 0);
+priv->ob_window_region  = pcim_iomap(dev, BAR_OB_WIN, 0);
+```
+
+`pcim_iomap()` creates a virtual address mapping with the physical addresses, and return the mapped virtual address. We will store them in our private struct.
+
+```c
+// qemu-epc-demo.c
+
+epc = devm_pci_epc_create(&dev->dev, &qemu_epc_ops);
+...
+priv->epc = epc;
+epc_set_drvdata(epc, priv);
+pci_set_drvdata(dev, priv);
+
+```
+This is the key function call, creating the `struct pci_epc` and bind it with our `pci_epc_ops` functions. After the function call, it causes the Configfs creating directory under `../configfs/pci_ep/controllers/qemu-epc-demo`.
+
+At last we will store the `priv` as the epc driver data with `epc_set_drvdata(epc, priv)` and the device driver data with `pci_set_drvdata(dev, priv)`.
+
+### 3.3 Tracing `set_bar()`
+
+When the EPF driver calls `pci_epc_set_bar()`, the EPC core acquires a
+mutex, validates the function number, and dispatches to the EPC driver's
+`set_bar()` implementation through the ops vtable.
+
+The EPF passes a `struct pci_epf_bar` which contains:
+- The BAR number (0, 1, or 2 in our demo)
+- The physical address of the backing memory (allocated by
+  `pci_epf_alloc_space()`)
+- The BAR size
+- Flags (memory type, prefetchable, etc.)
+
+The EPC driver's job is to write this information into the hardware so
+that the controller knows: "when the host accesses this BAR's PCI
+address range, forward the transaction to this physical memory on the
+EP side."
+
+In the `qemu-epc-demo`, this means writing the BAR number, flags,
+physical address, and size into the `BAR_CFG` region. Notice that the mask register
+is written last — it acts as a commit trigger. The hardware does not act
+on the other register values until the corresponding mask bit is set.
+This is a common hardware pattern: stage all the configuration values
+first, then write a single "go" register to apply them atomically.
+
+### 3.4 Tracing `write_header()` and `raise_irq`
+
+**`write_header`** receives a `struct pci_epf_header` containing the vendor_id, driver_id, revision, class code and interrupt pin. The EPC writes these values into the controller's PCI configuration space region. This is what the host see when it enumerate the PCIe bus - the host read the config space to discover the device's identities and capabilities. In the demo, we write vendor ID `0x1234` and device ID `0xDEAD`, which is what the host driver expect to match against.
+
+**`raise_irq`** is called by the EPF driver after it has finished processing a request and wants to notify the host. It receives a IRQ type (legacy, MSI, MSI-X) and an interrupt number - the IRQ type first, then the interrupt number. Writing the interrupt number is the trigger; the hardware sends a TLP message to the host, which cause the host'd IRQ handler to fire.
+
+Both functions follow the same pattern as `set_bar()`: the EPF driver
+calls a generic `pci_epc_*()` API, the EPC core dispatches through the
+vtable, and the EPC driver translates the call into hardware-specific
+register writes. The EPF driver never knows or cares which registers
+are being written — it just calls the standard interface.
+
+
+## 4. EPF Layer - Functional Driver
+
+### 4.1 EPF Bus
+
+The EPF subsystem has its own bus type: `pci_epf_bus_type`, which means that there is also an epf-device. This is specially designed so that the EPF driver talk to the EPF device, exposing the functional detail and configurations which are later exposed to the Host, without knowing what the underlying hardware is. Such design makes writing an EPF driver feels like writing a normal PCI driver.
+
+The EPF device and driver are matched with their name:
+```c
+// pci-epf-core.c
+
+static int pci_epf_device_match(struct device *dev, struct device_driver *drv)
+{
+	struct pci_epf *epf = to_pci_epf(dev);
+	struct pci_epf_driver *driver = to_pci_epf_driver(drv);
+
+	if (driver->id_table)
+		return pci_epf_match_id(driver->id_table, epf);
+
+	return !strcmp(epf->name, drv->name);
+}
+
+```
+
+When we install the epf-driver and create a epf-device through `mkdir` in Configfs, the bus matches them and call `.probe()`. This is different from normal PCI matching, which use vendorID and deviceID. The epf-device name comes from configfs directory name rather than hardware.
+
+
+### 4.2 Probe - Device Discovery
+As mentioned, when EPF driver and device are matched, the driver `.probe()` function is called.
+
+```c
+# qemu-epf-demo.c
+
+static int epf_demo_probe(struct pci_epf* epf)
+{
+    struct epf_demo* demo;
+    pr_info("qemu-epf-demo: probe is called!\n");
+
+    // ! Allocate memory
+    // ! devm version : Automatically released when the device is removed
+    demo = devm_kzalloc(&epf->dev, sizeof(*demo), GFP_KERNEL);
+    if (demo == NULL) {
+        pr_info("qemu-epf-demo: devm_kzalloc() failed\n");
+        return -ENOMEM;
+    }
+
+    // ! Set header & Save driver private info --> for later bind use
+    demo->epf = epf;
+    epf->header = &epf_demo_header;
+    epf_set_drvdata(epf, demo);
+
+    return 0;
+}
+```
+
+The demo `.probe()` function does 2 things: 1. Store the epf->header into the struct pci_epf (which represent our epf-device) 2. Allocate memory for the demo private data and save it in the struct pci_epf - so that it could be used in the `.bind()` function when EPF device link with EPC device.
+
+### 4.3 Bind - Where Everything happen
+
+The bind is triggered from userspace by creating a symlink:
+```
+ln -s /sys/kernel/config/pci_ep/functions/qemu-epf-demo/func1 \
+      /sys/kernel/config/pci_ep/controllers/<bus:device:function>/func1
+```
+
+This symlink basically tells the framework to connect this EPF device to this EPC controller. The VFS forwards the symlink operation to configfs, whichhas registered an `allow_link` callback on the controller group. This callback is `pci_primary_epc_epf_link` in `pci-ep-cfs.c`:
+
+```c
+
+static int pci_primary_epc_epf_link(struct config_item *epf_item,
+				    struct config_item *epc_item)
+{
+	int ret;
+	struct pci_epf_group *epf_group = to_pci_epf_group(epf_item->ci_parent);
+	struct pci_epc_group *epc_group = to_pci_epc_group(epc_item);
+	struct pci_epc *epc = epc_group->epc;
+	struct pci_epf *epf = epf_group->epf;
+
+	ret = pci_epc_add_epf(epc, epf, PRIMARY_INTERFACE);
+	if (ret)
+		return ret;
+
+	ret = pci_epf_bind(epf);
+	if (ret) {
+		pci_epc_remove_epf(epc, epf, PRIMARY_INTERFACE);
+		return ret;
+	}
+
+	return 0;
+}
+
+```
+
+On the EPC side, it calls the `pci_epc_add_epf()`. This function checks the type of the EPF function (PRIMARY/SECONDARY) and whether the epf has already bind with an EPC controller already. The key is an EPF device could only bind one EPC as PRIMARY function and one EPC as secondary function before unbind to prevent memory leak.
+
+The EPC allocate a function number to the EPF device for identification (One EPC controller could be binded to multiple EPF device) and lastly the epf device will obtain the reference of the pci_epc and the epf is added to the epf-list of the pci_epc.  
+
+```c
+// pci-epc-core.c
+
+int pci_epc_add_epf(struct pci_epc *epc, struct pci_epf *epf,
+		    enum pci_epc_interface_type type)
+{
+...
+
+  if (type == PRIMARY_INTERFACE) {
+    epf->func_no = func_no;
+    epf->epc = epc;
+    list = &epf->list;
+  } else {
+    epf->sec_epc_func_no = func_no;
+    epf->sec_epc = epc;
+    list = &epf->sec_epc_list;
+  }
+
+  list_add_tail(list, &epc->pci_epf);
+}
+```
+
+On the EPF side, it does a brunch of sanity checks, ensuring the epf device has driver associated with it, iterate over virtual function (SR-IOV: Not related here). And in the end call the driver registered `.bind()` function.
+
+```c
+  ret = epf->driver->ops->bind(epf);
+  epf->is_bound = true;
+```
+
+
+At this point, `epf->epc` is set. This is the key moment — the EPF
+driver can now reach the hardware through the EPC abstraction. Inside
+`epf_demo_bind()`, every hardware configuration call goes through the
+linked EPC:
+```c
+// qemu-epf-demo.c
+
+struct pci_epc *epc = epf->epc;
+
+pci_epc_write_header(epc, epf->func_no, ...);  // configure identity
+pci_epc_set_bar(epc, epf->func_no, ...);       // configure BARs
+pci_epc_raise_irq(epc, epf->func_no, ...);     // signal the host
+```
+
+The EPF driver never touches a hardware register directly. It calls
+generic `pci_epc_*()` APIs, passing the `epc` pointer it obtained
+through the bind. The EPC core dispatches these through the ops vtable
+to the hardware-specific implementation. The EPF driver focuses purely
+on the function logic — allocating BAR buffers, writing the magic
+value, polling the doorbell, performing case inversion — while the EPC
+layer handles all hardware detail underneath.
+
+This is the separation the framework provides: the EPF implements
+*what* the endpoint does, the EPC implements *how* the hardware is
+programmed.
+
+## 5. Configfs — Runtime Device Composition
+
+Configfs is the userspace interface for creating EPF devices and
+linking them to EPC controllers at runtime. After mounting, the
+framework exposes the following directory structure:
+```
+/sys/kernel/config/pci_ep/
+├── controllers/          ← one entry per registered EPC
+│   └── 0000:00:02.0/    ← created by devm_pci_epc_create()
+│       ├── start
+│       └── secondary/
+└── functions/            ← one entry per registered EPF driver
+    └── qemu-epf-demo/   ← created by pci_epf_register_driver()
+```
+
+The controller directory appears automatically when the EPC driver
+calls `devm_pci_epc_create()` during probe (Section 3.2). The function
+driver directory appears when the EPF driver calls
+`pci_epf_register_driver()` during module init. Everything else is
+driven by the following userspace commands.
+
+
+### Step 1: Mount configfs
+```bash
+mount -t configfs configfs /sys/kernel/config
+```
+
+Mounts the configfs virtual filesystem. The PCI endpoint subsystem
+registered itself with configfs at boot, so the `pci_ep/` directory
+appears immediately.
+
+
+### Step 2: Load the EPF driver
+```bash
+insmod qemu-epf-demo.ko
+```
+
+Calls `pci_epf_register_driver()`, which registers the driver on
+`pci_epf_bus_type`. No EPF device exists yet, so probe is not called.
+```
+[   13.473434] qemu_epf_demo: loading out-of-tree module taints kernel.
+[   13.478579] qemu-epf-demo: driver registered
+```
+
+
+### Step 3: Load the EPC driver
+```bash
+insmod qemu-epc-demo.ko
+```
+
+PCI bus matching triggers `qemu_epc_probe()`, which maps the BAR
+regions and calls `devm_pci_epc_create()` to register the controller
+(see Section 3.2 for detail).
+```
+[   21.945494] qemu-epc-demo: probe 0000:00:02.0
+[   21.945800] qemu-epc 0000:00:02.0: enabling device (0000 -> 0002)
+[   21.947140] qemu-epc-demo: ctrl=(____ptrval____) pci_cfg=(____ptrval____) bar_cfg=(____ptrval____) ob_window=(____ptrval____)
+[   21.949019] qemu-epc-demo: EPC controller registered!
+[   21.949286] qemu-epc-demo: check /sys/kernel/config/pci_ep/controllers/
+
+```
+
+
+### Step 4: Create the EPF device
+```bash
+mkdir /sys/kernel/config/pci_ep/functions/qemu-epf-demo/func1
+```
+
+Triggers `pci_epf_create("qemu-epf-demo")`, which registers an EPF
+device on the bus. Name matching fires and calls `epf_demo_probe()`
+(see Section 4.2 for detail). Configfs also populates `func1/` with
+attribute files (`vendorid`, `deviceid`, etc.) that can be overridden
+before binding.
+```
+[   41.314392] qemu-epf-demo: probe called
+```
+
+
+### Step 5: Link EPF to EPC
+```bash
+ln -s /sys/kernel/config/pci_ep/functions/qemu-epf-demo/func1 \
+      /sys/kernel/config/pci_ep/controllers/0000:00:02.0/
+```
+
+Triggers the configfs `allow_link` callback, which calls
+`pci_epc_add_epf()` then `pci_epf_bind()` (see Section 4.3 for the
+full call chain). The entire bind sequence is synchronous — the shell
+does not return until `epf_demo_bind()` completes.
+```
+[  118.965942] qemu-epf-demo: bind is called
+[  118.966618] qemu-epc-demo: Write Header: VendorId:0x1234 DeviceId: 0xdead
+...
+[  118.967158] qemu-epc-demo: interrupt_pin value=0x1 offset=0x3d size=4
+[  118.967631] qemu-epc-demo: set bar: 0 phys: 0x43519000 size: 0x1000
+[  118.968116] qemu-epf-demo: BAR0 size: 4096
+...
+[  118.968342] qemu-epc-demo: set bar: 1 phys: 0x43569000 size: 0x1000
+[  118.968670] qemu-epf-demo: BAR1 size: 4096
+...
+[  118.968845] qemu-epc-demo: set bar: 2 phys: 0x4355b000 size: 0x1000
+[  118.969170] qemu-epf-demo: BAR2 size: 4096
+```
+
+
+### Step 6: Start the EPC
+```bash
+echo 1 > /sys/kernel/config/pci_ep/controllers/0000:00:02.0/start
+```
+
+Triggers `pci_epc_start()` → `qemu_epc_start()`, which writes to the
+QEMU control register. QEMU begins listening on the Unix socket for
+TLP traffic from the host. The PCIe link is now live.
+```
+[  275.560711] qemu-epc-demo: start
+[  275.665719] qemu-epc-demo: Qemu-EPC started
+```
+
+The EP is fully configured. The next step is to boot the host VM and
+load the host driver.
+
+## Run the demo
 
 ### Tools Requirement
 * Linux 6.1.166 
