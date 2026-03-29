@@ -166,10 +166,12 @@ static int qemu_epf_probe(struct pci_epf *epf)
         pr_info("qemu-epf-demo: devm_kzalloc() failed\n");
         return -ENOMEM;
     }
+
     priv->epf = epf;
     priv->kthr_stop = 0;
     epf_set_drvdata(epf, priv);
 
+    epf->driver = qemu_epf_header;
     pr_info("qemu-epf-demo: probe() completed\n");
     return 0;
 }

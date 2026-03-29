@@ -16,7 +16,7 @@
 #define QEMU_EPC_BAR_BAR_CFG   2
 #define QEMU_EPC_BAR_OB_WINDOW 3
 
-/* PCI_CFG register offset */
+/* CTRL register offset */
 #define QEMU_EPC_CTRL_OFF_START       0x00
 #define QEMU_EPC_CTRL_OFF_WIN_START   0x08
 #define QEMU_EPC_CTRL_OFF_WIN_SIZE    0x10

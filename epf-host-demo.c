@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/pci-epf.h>
@@ -62,17 +63,13 @@ static int epf_host_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     pr_info("epf-host: probe %s\n", pci_name(pdev));
 
-    /* 1. Enable the device, interrupt, bar, device ready */
     err = pci_enable_device(pdev);
     if (err) {
         pr_err("epf-host: pci_enable_device() failed: %d\n", err);
         return err;
     }
 
-    /* 2. Set Master */
     pci_set_master(pdev);
-    
-    /* 3. Request Region: So that no other device will use the address region */
     err = pci_request_regions(pdev, "epf-host");
     if (err) {
         pr_err("epf-host: pci_request_region() failed: %d\n", err);
@@ -90,7 +87,6 @@ static int epf_host_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     priv->pdev = pdev;
 
-    /* map physical address to virtual address */
     priv->bar0 = pcim_iomap(pdev, BAR_0, 0);
     priv->bar1 = pcim_iomap(pdev, BAR_1, 0);
     priv->bar2 = pcim_iomap(pdev, BAR_2, 0);
@@ -100,7 +96,7 @@ static int epf_host_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_release;
     }
 
-    /* Extra: Register Interrupt handler */
+    /* Register Interrupt handler */
     err = request_irq(pdev->irq, epf_host_irq_handler, IRQF_SHARED,
                       "epf-host", priv);
     if (err) {
@@ -167,3 +163,4 @@ module_pci_driver(epf_host_driver);
 MODULE_DESCRIPTION("QEMU Host side driver");
 MODULE_AUTHOR("Elton Wong");
 MODULE_LICENSE("GPL");
+
