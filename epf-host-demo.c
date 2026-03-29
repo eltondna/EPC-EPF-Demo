@@ -7,7 +7,7 @@
 #define EPF_DEMO_BAR_SIZE 4096
 
 enum BAR0_REG_OFF {
-    REG_MAGIC     = 0x0,
+    REG_MAGIC     = 0x00,
     REG_DOORBELL  = 0x04,
     HOST_SIZE     = 0x08,
     EP_SIZE       = 0x0C,
@@ -42,6 +42,7 @@ irqreturn_t epf_host_irq_handler(int irq, void *data)
         pr_err("epf-host: kmalloc() failed\n");
         return IRQ_HANDLED;
     }
+    
     memset(buffer, 0, ALIGN(size + 1, 4));
 
     memcpy_fromio(buffer, priv->bar2, ALIGN(size, 4));
@@ -98,7 +99,6 @@ static int epf_host_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         err = -ENOMEM;
         goto err_release;
     }
-
 
     /* Extra: Register Interrupt handler */
     err = request_irq(pdev->irq, epf_host_irq_handler, IRQF_SHARED,
