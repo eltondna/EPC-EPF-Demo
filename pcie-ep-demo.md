@@ -10,7 +10,7 @@ The system consists of four components running across two virtual machines conne
 
 | Component | Location | Role |
 |-----------|----------|------|
-| `elton-host-demo.ko` | Host VM | Standard PCI driver. Maps BARs, sends data via BAR1, reads EP response from BAR2 via IRQ handler. |
+| `epf-host-demo.ko` | Host VM | Standard PCI driver. Maps BARs, sends data via BAR1, reads EP response from BAR2 via IRQ handler. |
 | `qemu-epf-demo.ko` | EP VM | EPF function driver. Allocates BAR buffers, polls doorbell, performs case inversion, raises IRQ. |
 | `qemu-epc-demo.ko` | EP VM | EPC controller driver. Bridges the Linux `pci_epc` framework to the QEMU virtual hardware via MMIO registers. |
 |`qemu-epc` (QEMU)| EP VM | Virtual PCIe hardware. Translates MMIO writes into TLP packets at endpoint side and forwards them to `ebf-bridge` via Unix socket.
